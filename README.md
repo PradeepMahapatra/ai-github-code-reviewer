@@ -27,4 +27,20 @@ Initial project setup
    cp .env.example .env
    ```
 
-The application and integrations will be added in later development chunks.
+4. Export a GitHub token in the shell:
+
+   ```bash
+   export GITHUB_TOKEN="your-token"
+   ```
+
+5. Retrieve a pull request and its changed files:
+
+   ```bash
+   python -m app.github_pr_reviewer OWNER REPOSITORY PULL_REQUEST_NUMBER
+   ```
+
+Run the unit tests with:
+
+```bash
+python -m pytest
+```
