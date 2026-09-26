@@ -6,12 +6,57 @@ from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
 from app.config import Settings
+from app.github_client import ChangedFile, GitHubApiError, PullRequest
 from app.main import app
 import app.routers.webhook as webhook_router
 
 
 client = TestClient(app)
 TEST_SECRET = "test-webhook-secret"
+
+
+class FakeGitHubApiClient:
+    calls: list[tuple[str, str, str, int]] = []
+    error: GitHubApiError | None = None
+
+    def __init__(self, token: str | None = None) -> None:
+        self.token = token
+        self.calls = []
+        FakeGitHubApiClient.calls = self.calls
+
+    def __enter__(self) -> "FakeGitHubApiClient":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def get_pull_request(self, owner: str, repository: str, number: int) -> PullRequest:
+        self.calls.append(("pull_request", owner, repository, number))
+        if self.error:
+            raise self.error
+        return PullRequest(
+            number=number,
+            title="Retrieved Pull Request title",
+            state="open",
+            head_sha="retrieved-head-sha",
+        )
+
+    def get_changed_files(
+        self, owner: str, repository: str, number: int
+    ) -> list[ChangedFile]:
+        self.calls.append(("changed_files", owner, repository, number))
+        if self.error:
+            raise self.error
+        return [
+            ChangedFile(
+                filename="app/main.py",
+                status="modified",
+                additions=3,
+                deletions=1,
+                changes=4,
+                patch="@@ -1 +1,3 @@",
+            )
+        ]
 
 
 def webhook_headers(signature: str | None = None, event: str = "pull_request") -> dict[str, str]:
@@ -35,6 +80,9 @@ def configure_test_secret(monkeypatch) -> None:
         "get_settings",
         lambda: Settings(_env_file=None, github_webhook_secret=SecretStr(TEST_SECRET)),
     )
+    FakeGitHubApiClient.calls = []
+    FakeGitHubApiClient.error = None
+    monkeypatch.setattr(webhook_router, "GitHubApiClient", FakeGitHubApiClient)
 
 
 def pull_request_payload(action: str = "opened") -> dict[str, object]:
@@ -79,11 +127,31 @@ def test_supported_event_extracts_internal_pull_request_fields(monkeypatch) -> N
         "repository_owner": "octo-owner",
         "repository_name": "review-target",
         "pull_request_number": 42,
-        "pull_request_title": "Improve reviewer output",
+        "pull_request_title": "Retrieved Pull Request title",
         "action": "opened",
-        "head_commit_sha": "abc123def456",
+        "head_commit_sha": "retrieved-head-sha",
+        "changed_files": [
+            {
+                "filename": "app/main.py",
+                "status": "modified",
+                "additions": 3,
+                "deletions": 1,
+                "changes": 4,
+                "patch": "@@ -1 +1,3 @@",
+            }
+        ],
     }
     assert response.json()["message"] == "Pull Request event accepted for processing"
+
+
+def test_supported_event_passes_repository_and_number_to_client(monkeypatch) -> None:
+    response = post_signed_webhook(monkeypatch, pull_request_payload())
+
+    assert response.status_code == 200
+    assert FakeGitHubApiClient.calls == [
+        ("pull_request", "octo-owner", "review-target", 42),
+        ("changed_files", "octo-owner", "review-target", 42),
+    ]
 
 
 def test_unsupported_pull_request_action_is_ignored(monkeypatch) -> None:
@@ -92,6 +160,7 @@ def test_unsupported_pull_request_action_is_ignored(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "ignored"
     assert response.json()["reason"] == "unsupported pull request action"
+    assert FakeGitHubApiClient.calls == []
 
 
 def test_unrelated_event_is_ignored(monkeypatch) -> None:
@@ -104,6 +173,23 @@ def test_unrelated_event_is_ignored(monkeypatch) -> None:
     assert response.status_code == 200
     assert response.json()["status"] == "ignored"
     assert response.json()["reason"] == "unsupported event type"
+    assert FakeGitHubApiClient.calls == []
+
+
+def test_github_api_failure_returns_safe_error(monkeypatch) -> None:
+    configure_test_secret(monkeypatch)
+    FakeGitHubApiClient.error = GitHubApiError(500, "internal details")
+    payload = pull_request_payload()
+    raw_payload = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+
+    response = client.post(
+        "/webhook",
+        headers=webhook_headers(sign_payload(raw_payload)),
+        content=raw_payload,
+    )
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Unable to retrieve Pull Request data"}
 
 
 def test_missing_required_pull_request_field_returns_bad_request(monkeypatch) -> None:
